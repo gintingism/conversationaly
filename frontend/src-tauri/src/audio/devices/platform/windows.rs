@@ -98,7 +98,7 @@ pub fn configure_windows_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
 /// otherwise falls back to min_sample_rate to avoid high sampling rates (96k/192k)
 /// that cause buffer starvation and downsampling artifacts.
 fn pick_best_sample_rate(config: &cpal::SupportedStreamConfigRange) -> cpal::SupportedStreamConfig {
-    const TARGET_RATE: cpal::SampleRate = cpal::SampleRate(48000);
+    const TARGET_RATE: cpal::SampleRate = 48000;
     let sample_rate = if config.min_sample_rate() <= TARGET_RATE && TARGET_RATE <= config.max_sample_rate() {
         TARGET_RATE
     } else {
