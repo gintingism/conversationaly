@@ -93,6 +93,20 @@ pub fn configure_windows_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
     Ok(devices)
 }
 
+/// Helper to pick the best sample rate from a supported config range.
+/// Prioritizes standard 48,000 Hz (conversationaly's target rate) if supported,
+/// otherwise falls back to min_sample_rate to avoid high sampling rates (96k/192k)
+/// that cause buffer starvation and downsampling artifacts.
+fn pick_best_sample_rate(config: &cpal::SupportedStreamConfigRange) -> cpal::SupportedStreamConfig {
+    const TARGET_RATE: cpal::SampleRate = cpal::SampleRate(48000);
+    let sample_rate = if config.min_sample_rate() <= TARGET_RATE && TARGET_RATE <= config.max_sample_rate() {
+        TARGET_RATE
+    } else {
+        config.min_sample_rate()
+    };
+    config.with_sample_rate(sample_rate)
+}
+
 /// Get Windows device and configuration using WASAPI
 pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let wasapi_host = cpal::host_from_id(cpal::HostId::Wasapi)
@@ -138,7 +152,7 @@ pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, c
                                         // First try to find F32 format with 2 channels (stereo)
                                         for config in &configs {
                                             if config.sample_format() == cpal::SampleFormat::F32 && config.channels() == 2 {
-                                                let config = config.with_max_sample_rate();
+                                                let config = pick_best_sample_rate(config);
                                                 // info!("Using stereo F32 input config: {:?}", config);
                                                 return Ok((device, config));
                                             }
@@ -147,14 +161,14 @@ pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, c
                                         // Then try any F32 format
                                         for config in &configs {
                                             if config.sample_format() == cpal::SampleFormat::F32 {
-                                                let config = config.with_max_sample_rate();
+                                                let config = pick_best_sample_rate(config);
                                                 // info!("Using F32 input config: {:?}", config);
                                                 return Ok((device, config));
                                             }
                                         }
 
                                         // Finally, use the first available config
-                                        let config = configs[0].with_max_sample_rate();
+                                        let config = pick_best_sample_rate(&configs[0]);
                                         info!("Using fallback input config: {:?}", config);
                                         return Ok((device, config));
                                     }
@@ -178,7 +192,7 @@ pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, c
                         return Ok((default_device, config));
                     } else if let Ok(supported_configs) = default_device.supported_input_configs() {
                         if let Some(config) = supported_configs.into_iter().next() {
-                            return Ok((default_device, config.with_max_sample_rate()));
+                            return Ok((default_device, pick_best_sample_rate(&config)));
                         }
                     }
                 }
@@ -192,45 +206,55 @@ pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, c
                     if name == base_name || name.contains(base_name) {
                         // info!("Found matching output device: {}", name);
 
-                        // For output devices, we want to use them in loopback mode
-                        if let Ok(supported_configs) = device.supported_output_configs() {
-                            let configs: Vec<_> = supported_configs.collect();
-                            if configs.is_empty() {
-                                warn!("No supported output configurations found for device: {}", name);
-                            } else {
-                                // info!("Found {} supported output configurations", configs.len());
-
-                                // Try to find a config that supports f32 format with 2 channels (stereo)
-                                for config in &configs {
-                                    if config.sample_format() == cpal::SampleFormat::F32 && config.channels() == 2 {
-                                        let config = config.with_max_sample_rate();
-                                        info!("Using stereo F32 output config: {:?}", config);
-                                        return Ok((device, config));
-                                    }
-                                }
-
-                                // Then try any F32 format
-                                for config in &configs {
-                                    if config.sample_format() == cpal::SampleFormat::F32 {
-                                        let config = config.with_max_sample_rate();
-                                        // info!("Using F32 output config: {:?}", config);
-                                        return Ok((device, config));
-                                    }
-                                }
-
-                                // Finally, use the first available config
-                                let config = configs[0].with_max_sample_rate();
-                                // info!("Using fallback output config: {:?}", config);
-                                return Ok((device, config));
+                        // CRITICAL FOR WASAPI LOOPBACK:
+                        // In WASAPI shared mode loopback capture (AUDCLNT_STREAMFLAGS_LOOPBACK),
+                        // the capture stream MUST match the Windows Audio Engine mix format
+                        // returned by IAudioClient::GetMixFormat() (i.e. default_output_config()).
+                        // Using with_max_sample_rate() forces 96kHz or 192kHz, which breaks
+                        // the downsampler/resampler and causes the audio ring buffer to zero-pad
+                        // 75%+ of audio windows with silence, resulting in severely muffled/attenuated audio.
+                        match device.default_output_config() {
+                            Ok(default_config) => {
+                                info!("Using default mix format output config for loopback: {:?}", default_config);
+                                return Ok((device, default_config));
                             }
-                        } else {
-                            warn!("Could not enumerate supported configurations for device: {}", name);
-                        }
+                            Err(e) => {
+                                warn!("Failed to get default output config: {}. Trying supported configs...", e);
 
-                        // If we couldn't get supported configs, try default
-                        if let Ok(default_config) = device.default_output_config() {
-                            // info!("Using default output config: {:?}", default_config);
-                            return Ok((device, default_config));
+                                if let Ok(supported_configs) = device.supported_output_configs() {
+                                    let configs: Vec<_> = supported_configs.collect();
+                                    if configs.is_empty() {
+                                        warn!("No supported output configurations found for device: {}", name);
+                                    } else {
+                                        // Try to find a config that supports f32 format with 2 channels (stereo)
+                                        for config in &configs {
+                                            if config.sample_format() == cpal::SampleFormat::F32 && config.channels() == 2 {
+                                                let config = pick_best_sample_rate(config);
+                                                info!("Using stereo F32 output config: {:?}", config);
+                                                return Ok((device, config));
+                                            }
+                                        }
+
+                                        // Then try any F32 format
+                                        for config in &configs {
+                                            if config.sample_format() == cpal::SampleFormat::F32 {
+                                                let config = pick_best_sample_rate(config);
+                                                info!("Using F32 output config: {:?}", config);
+                                                return Ok((device, config));
+                                            }
+                                        }
+
+                                        // Finally, use the first available config
+                                        let config = pick_best_sample_rate(&configs[0]);
+                                        info!("Using fallback output config: {:?}", config);
+                                        return Ok((device, config));
+                                    }
+                                } else {
+                                    warn!("Could not enumerate supported configurations for device: {}", name);
+                                }
+
+                                return Err(anyhow!("No compatible output configuration found for device: {}", name));
+                            }
                         }
                     }
                 }
@@ -245,7 +269,7 @@ pub fn get_windows_device(audio_device: &AudioDevice) -> Result<(cpal::Device, c
                         return Ok((default_device, config));
                     } else if let Ok(supported_configs) = default_device.supported_output_configs() {
                         if let Some(config) = supported_configs.into_iter().next() {
-                            return Ok((default_device, config.with_max_sample_rate()));
+                            return Ok((default_device, pick_best_sample_rate(&config)));
                         }
                     }
                 }
